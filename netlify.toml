@@ -1,0 +1,10 @@
+# 当本目录（storyboard-review）作为 Netlify 仓库根目录或「Base directory」时使用。
+[build]
+  publish = "."
+  command = "echo 'Static site, no build' && exit 0"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "SAMEORIGIN"
+    X-Content-Type-Options = "nosniff"

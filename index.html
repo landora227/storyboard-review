@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>分镜审核台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>分镜审核台</h1>
+      <p>
+        PDF 按页完整展示。拖竖线调分镜/审核区与教研/导演比例；格内竖线调参考图与文字宽。分镜放大后滚轮缩放。
+      </p>
+      <div class="toolbar-actions">
+        <div class="toolbar-end-cluster">
+          <input id="pdf-input" type="file" class="hidden-input" accept="application/pdf" title="" />
+          <label for="pdf-input" class="btn btn-sm btn-primary pdf-import-label">导入 PDF 分镜</label>
+          <span id="share-actions" class="share-actions" hidden>
+            <button type="button" id="btn-share-edit" class="btn btn-sm btn-share-edit" title="生成可编辑的分享链接">
+              审核分享
+            </button>
+            <button type="button" id="btn-share-read" class="btn btn-sm btn-share-read" title="生成仅预览的分享链接">
+              阅读分享
+            </button>
+            <button type="button" id="btn-collab-host" class="btn btn-sm btn-collab-host" title="开启实时协作房间（需自建协作服务）">
+              协作房间
+            </button>
+            <button type="button" id="btn-exit-collab" class="btn btn-sm btn-exit-collab" hidden>退出协作</button>
+            <input id="share-import-input" type="file" class="hidden-input" accept="application/json,.json" title="" />
+            <label for="share-import-input" class="btn btn-sm btn-tonal share-import-label">导入分享</label>
+          </span>
+          <button type="button" id="btn-exit-share" class="btn btn-sm btn-exit-share" hidden>退出分享页</button>
+          <button type="button" id="btn-back-editor" class="btn btn-sm btn-back" style="display: none">返回编辑</button>
+          <button type="button" id="btn-archive-lib" class="btn btn-sm btn-archive">归档库</button>
+        </div>
+      </div>
+      <p id="share-mode-hint" class="share-mode-hint" hidden></p>
+    </header>
+    <main id="main"></main>
+    <div id="storyboard-lightbox" class="lightbox" hidden aria-modal="true" role="dialog" aria-label="分镜放大">
+      <button type="button" class="lightbox-backdrop" aria-label="关闭"></button>
+      <div class="lightbox-panel">
+        <div class="lightbox-zoom-outer">
+          <div id="lightbox-zoom-wrap" class="lightbox-zoom-wrap">
+            <img id="lightbox-img" class="lightbox-zoom-img" alt="分镜放大预览" />
+          </div>
+        </div>
+        <div class="lightbox-toolbar">
+          <button type="button" id="lb-zoom-out" class="btn btn-sm btn-tonal" title="缩小">−</button>
+          <span id="lb-zoom-pct" class="lb-zoom-pct">100%</span>
+          <button type="button" id="lb-zoom-in" class="btn btn-sm btn-tonal" title="放大">+</button>
+          <button type="button" id="lb-zoom-reset" class="btn btn-sm btn-tonal">还原</button>
+          <button type="button" class="btn btn-sm btn-tonal lightbox-close">关闭（Esc）</button>
+        </div>
+        <p class="lightbox-hint">滚轮缩放 · 放大后可拖拽平移</p>
+      </div>
+    </div>
+    <div id="text-hover-layer" class="text-hover-layer" hidden role="tooltip"></div>
+    <div id="ref-gallery" class="gallery-modal" hidden aria-modal="true" role="dialog" aria-label="参考图浏览">
+      <button type="button" class="gallery-backdrop" aria-label="关闭"></button>
+      <div class="gallery-dialog">
+        <img id="gallery-main-img" class="gallery-main-img" alt="参考图" />
+        <div class="gallery-nav">
+          <button type="button" id="gal-prev" class="btn btn-sm btn-tonal">上一张</button>
+          <button type="button" id="gal-next" class="btn btn-sm btn-tonal">下一张</button>
+          <button type="button" class="btn btn-sm btn-tonal gallery-close">关闭</button>
+        </div>
+      </div>
+    </div>
+    <!-- 非 module：用 file:// 直接打开时 Chrome 会拦截 ES Module，导致按钮无响应 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" crossorigin="anonymous"></script>
+    <script src="./archive-db.js"></script>
+    <script>
+      if (typeof pdfjsLib !== "undefined") {
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      }
+    </script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

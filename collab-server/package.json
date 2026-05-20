@@ -1,0 +1,20 @@
+{
+  "name": "storyboard-review-collab-server",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Yjs WebSocket 协作服：最多 6 人编辑、只读连接禁止写入、房间口令",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "lib0": "^0.2.102",
+    "lodash.debounce": "^4.0.8",
+    "ws": "^8.18.0",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.27"
+  }
+}
