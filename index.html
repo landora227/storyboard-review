@@ -63,6 +63,31 @@
       </div>
     </div>
     <div id="text-hover-layer" class="text-hover-layer" hidden role="tooltip"></div>
+    <dialog id="collab-setup-dialog" class="collab-dialog" aria-labelledby="collab-setup-title">
+      <form id="collab-setup-form" method="dialog">
+        <h2 id="collab-setup-title">开启协作房间</h2>
+        <p class="collab-dialog-lead">
+          多人实时同步分镜、参考图与文字。须先部署 <code>collab-server</code>（见仓库
+          <code>DEPLOY-COLLAB.md</code>），填写 HTTPS 根地址。
+        </p>
+        <label class="collab-dialog-label" for="collab-ws-input">协作服务器地址</label>
+        <input
+          id="collab-ws-input"
+          class="collab-dialog-input"
+          type="url"
+          inputmode="url"
+          autocomplete="off"
+          placeholder="https://storyboard-review-collab.onrender.com"
+          required
+        />
+        <p id="collab-setup-status" class="collab-setup-status" role="status"></p>
+        <div class="collab-dialog-actions">
+          <button type="button" id="collab-test-btn" class="btn btn-sm btn-tonal">测试连接</button>
+          <button type="submit" class="btn btn-sm btn-primary">创建房间</button>
+          <button type="button" id="collab-cancel-btn" class="btn btn-sm">取消</button>
+        </div>
+      </form>
+    </dialog>
     <div id="ref-gallery" class="gallery-modal" hidden aria-modal="true" role="dialog" aria-label="参考图浏览">
       <button type="button" class="gallery-backdrop" aria-label="关闭"></button>
       <div class="gallery-dialog">
@@ -77,6 +102,7 @@
     <!-- 非 module：用 file:// 直接打开时 Chrome 会拦截 ES Module，导致按钮无响应 -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" crossorigin="anonymous"></script>
     <script src="./archive-db.js"></script>
+    <script src="./collab-config.js"></script>
     <script>
       if (typeof pdfjsLib !== "undefined") {
         pdfjsLib.GlobalWorkerOptions.workerSrc =

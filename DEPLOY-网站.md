@@ -101,14 +101,17 @@ docker compose up --build
 
 ---
 
-## 协作服务单独上网（可选）
+## 多人实时协作（须单独部署）
 
-静态站上了 HTTPS 后，协作地址也必须是 **HTTPS/WSS**。可把 **`collab-server`** 用自带 **Dockerfile** 部署到：
+GitHub Pages **只托管静态页面**，协作需要公网 **HTTPS/WSS** 的 `collab-server`。
 
-- [Fly.io](https://fly.io/)、[Railway](https://railway.app/)、[Render](https://render.com/) 等支持 Docker 的平台；  
-- 或自己的 VPS：`docker run -p 2345:2345 ...` 前面再挂 Nginx 做 TLS。
+**一步步说明见：[DEPLOY-COLLAB.md](./DEPLOY-COLLAB.md)**（含 Render 一键 Blueprint、`collab-config.js` 配置）。
 
-环境变量 `PORT`、`COLLAB_MAX_EDITORS` 等见 **`collab-server/README.md`**。
+简要步骤：
+
+1. 用仓库根目录 **`render.yaml`** 在 Render 部署协作服。  
+2. 把 **`collab-config.js`** 里的 `STORYBOARD_COLLAB_WS` 改成你的协作服 URL 并 push。  
+3. 在已上线的分镜台里点 **协作房间** → 测试连接 → 创建房间 → 把编辑/阅读链接发给同事。
 
 ---
 

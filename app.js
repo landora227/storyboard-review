@@ -35,6 +35,10 @@ const state = {
   collabActive: false,
   /** @type {{ destroy: () => void, ydoc?: import("yjs").Doc } | null} */
   collabSession: null,
+  /** @type {"connecting" | "connected" | "disconnected" | null} */
+  collabConnStatus: null,
+  /** @type {string | null} */
+  collabConnError: null,
 };
 
 const pdfJsReady = typeof pdfjsLib !== "undefined";
@@ -594,13 +598,104 @@ function destroyCollabSessionLocal() {
   }
   state.collabSession = null;
   state.collabActive = false;
+  state.collabConnStatus = null;
+  state.collabConnError = null;
   delete window.__collabGetMeta;
   delete window.__collabApplyFromY;
+}
+
+/** @param {"connecting" | "connected" | "disconnected"} status */
+function onCollabProviderStatus(status) {
+  state.collabConnStatus = status;
+  state.collabConnError = null;
+  updateShareChrome();
+}
+
+/** @param {string} message */
+function onCollabProviderError(message) {
+  state.collabConnStatus = "disconnected";
+  state.collabConnError = message;
+  updateShareChrome();
+}
+
+/** @returns {Record<string, () => void>} */
+function collabSessionHooks(extra) {
+  return {
+    onStatus: onCollabProviderStatus,
+    onError: onCollabProviderError,
+    onSynced: () => {
+      state.collabConnStatus = "connected";
+      state.collabConnError = null;
+      updateShareChrome();
+      extra?.onSynced?.();
+    },
+  };
+}
+
+function collabStatusLine() {
+  if (state.collabConnError) return `协作：${state.collabConnError}`;
+  if (state.collabConnStatus === "connecting") return "协作：正在连接…";
+  if (state.collabConnStatus === "disconnected") return "协作：已断开，请检查网络或协作服务是否在线。";
+  if (state.collabConnStatus === "connected") return "协作：已连接，编辑实时同步中。";
+  return "";
 }
 
 /**
  * @returns {Promise<boolean>}
  */
+/**
+ * @param {string} apiBase
+ * @param {boolean} readOnly
+ */
+async function openShareFromServerId(apiBase, readOnly) {
+  const raw = location.hash.replace(/^#/, "");
+  const prefix = readOnly ? "share-read=id:" : "share-edit=id:";
+  if (!raw.startsWith(prefix)) return false;
+  const id = raw.slice(prefix.length).trim();
+  if (!id || !/^[a-zA-Z0-9_-]{8,64}$/.test(id)) return false;
+
+  if (window.location.protocol === "https:" && apiBase.startsWith("http://")) {
+    if (els.main) {
+      els.main.innerHTML =
+        '<div class="empty-state empty-state--warn"><p><strong>无法打开分享</strong>：当前页面为 HTTPS，分享服务地址须为 <code>https://</code>。</p></div>';
+    }
+    state.fromShare = true;
+    state.shareReadOnly = true;
+    document.body.classList.add("share-readonly");
+    return true;
+  }
+
+  if (els.main) {
+    els.main.innerHTML = '<div class="loading"><div class="spinner"></div><span>正在加载分享内容…</span></div>';
+  }
+  try {
+    const data = await fetchShareSnapshot(apiBase, id);
+    applySharePayloadToState(data, readOnly);
+    showEditorView();
+    applyAllLayoutGlobals();
+    renderBoard();
+    const shareSlots = state.pendingShareSlots;
+    if (shareSlots) {
+      applySlotPayload(shareSlots);
+      state.sessionSlots = cloneSlots(shareSlots);
+      state.pendingShareSlots = null;
+    }
+    updateShareChrome();
+    return true;
+  } catch (e) {
+    console.error(e);
+    state.fromShare = true;
+    state.shareReadOnly = true;
+    if (els.main) {
+      els.main.innerHTML =
+        '<div class="empty-state empty-state--warn"><p><strong>无法加载分享</strong>：链接已过期、服务未启动，或 <code>collab-config.js</code> 中的服务地址不正确。</p></div>';
+    }
+    document.body.classList.add("share-readonly");
+    updateShareChrome();
+    return true;
+  }
+}
+
 async function tryConsumeCollabHash() {
   const raw = location.hash.replace(/^#/, "");
   if (!raw.startsWith("collab-v1=")) return false;
@@ -661,20 +756,171 @@ async function tryConsumeCollabHash() {
     rows: loadRowWeights(),
   });
   window.__collabApplyFromY = applyCollabFromY;
-  const sess = window.__collabJoinSession(L.ws, L.room, L.token, readOnly, {
-    onSynced: () => updateShareChrome(),
-  });
+  state.collabConnStatus = "connecting";
+  const sess = window.__collabJoinSession(L.ws, L.room, L.token, readOnly, collabSessionHooks());
   state.collabSession = sess;
   return true;
 }
 
 function loadCollabWsDefault() {
+  const cfg =
+    typeof window.STORYBOARD_COLLAB_WS === "string" && window.STORYBOARD_COLLAB_WS.trim()
+      ? window.STORYBOARD_COLLAB_WS.trim()
+      : "";
+  if (cfg) return cfg;
   try {
     const s = localStorage.getItem(LS_COLLAB_WS);
-    return s && s.trim() ? s.trim() : "http://127.0.0.1:2345";
+    if (s && s.trim()) return s.trim();
   } catch (_) {
+    /* ignore */
+  }
+  if (location.hostname === "localhost" || location.hostname === "127.0.0.1") {
     return "http://127.0.0.1:2345";
   }
+  return "";
+}
+
+/** @param {string} httpBase */
+function collabHttpOrigin(httpBase) {
+  const b = httpBase.trim().replace(/\/$/, "");
+  if (b.startsWith("ws://")) return `http://${b.slice(5)}`;
+  if (b.startsWith("wss://")) return `https://${b.slice(6)}`;
+  return b;
+}
+
+/**
+ * @param {string} apiBase
+ * @param {object} bundle
+ * @returns {Promise<string>}
+ */
+async function uploadShareSnapshot(apiBase, bundle) {
+  const origin = collabHttpOrigin(apiBase);
+  const r = await fetch(`${origin}/api/share`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bundle }),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || `HTTP ${r.status}`);
+  }
+  const j = await r.json();
+  if (!j.ok || typeof j.id !== "string") throw new Error("invalid share response");
+  return j.id;
+}
+
+/**
+ * @param {string} apiBase
+ * @param {string} id
+ */
+async function fetchShareSnapshot(apiBase, id) {
+  const origin = collabHttpOrigin(apiBase);
+  const r = await fetch(`${origin}/api/share/${encodeURIComponent(id)}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || `HTTP ${r.status}`);
+  }
+  const j = await r.json();
+  if (!j.ok || !j.bundle) throw new Error("share not found");
+  return j.bundle;
+}
+
+/**
+ * @returns {Promise<string | null>}
+ */
+async function openCollabSetupDialog() {
+  const dlg = document.getElementById("collab-setup-dialog");
+  const input = document.getElementById("collab-ws-input");
+  const statusEl = document.getElementById("collab-setup-status");
+  const testBtn = document.getElementById("collab-test-btn");
+  if (!(dlg instanceof HTMLDialogElement) || !(input instanceof HTMLInputElement)) {
+    const wsDefault = loadCollabWsDefault() || "http://127.0.0.1:2345";
+    const wsIn = prompt(
+      "协作服务器 HTTP 根地址（需已运行 collab-server）\n示例：https://storyboard-review-collab.onrender.com",
+      wsDefault,
+    );
+    return wsIn && wsIn.trim() ? wsIn.trim() : null;
+  }
+
+  input.value = loadCollabWsDefault() || "http://127.0.0.1:2345";
+  if (statusEl) {
+    statusEl.textContent = "";
+    statusEl.className = "collab-setup-status";
+  }
+
+  const setStatus = (text, kind = "") => {
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    statusEl.className = "collab-setup-status" + (kind ? ` collab-setup-status--${kind}` : "");
+  };
+
+  const testHandler = async () => {
+    const base = input.value.trim();
+    if (!base) {
+      setStatus("请填写协作服务器地址。", "err");
+      return;
+    }
+    if (location.protocol === "https:" && base.startsWith("http://")) {
+      setStatus("当前页面为 HTTPS，协作地址须为 https://（不能填 http://）。", "err");
+      return;
+    }
+    setStatus("正在测试连接…", "wait");
+    try {
+      await ensureCollabModule();
+      const ok = await window.__collabPingServer?.(base);
+      setStatus(ok ? "连接成功，可以创建房间。" : "无法连接：请确认协作服已部署且地址正确。", ok ? "ok" : "err");
+    } catch (e) {
+      setStatus(String(/** @type {Error} */ (e).message || e), "err");
+    }
+  };
+
+  if (testBtn) {
+    testBtn.onclick = () => void testHandler();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (/** @type {string | null} */ val) => {
+      if (settled) return;
+      settled = true;
+      if (testBtn) testBtn.onclick = null;
+      dlg.removeEventListener("close", onClose);
+      document.getElementById("collab-setup-form")?.removeEventListener("submit", onSubmit);
+      document.getElementById("collab-cancel-btn")?.removeEventListener("click", onCancel);
+      resolve(val);
+    };
+
+    const onCancel = () => {
+      if (dlg.open) dlg.close("cancel");
+      else finish(null);
+    };
+
+    const onClose = () => {
+      if (dlg.returnValue === "host") return;
+      finish(null);
+    };
+
+    const onSubmit = (/** @type {Event} */ e) => {
+      e.preventDefault();
+      const base = input.value.trim();
+      if (!base) {
+        setStatus("请填写协作服务器地址。", "err");
+        return;
+      }
+      if (location.protocol === "https:" && base.startsWith("http://")) {
+        setStatus("当前页面为 HTTPS，协作地址须为 https://。", "err");
+        return;
+      }
+      saveCollabWsDefault(base);
+      dlg.close("host");
+      finish(base);
+    };
+
+    dlg.addEventListener("close", onClose);
+    document.getElementById("collab-setup-form")?.addEventListener("submit", onSubmit);
+    document.getElementById("collab-cancel-btn")?.addEventListener("click", onCancel);
+    dlg.showModal();
+  });
 }
 
 function saveCollabWsDefault(ws) {
@@ -700,11 +946,8 @@ async function startCollabHostFlow() {
     alert("请先导入 PDF 分镜后再开启协作。");
     return;
   }
-  const wsDefault = loadCollabWsDefault();
-  const wsIn = prompt("协作服务器 HTTP 根地址（需已运行 collab-server，含端口）\n示例：http://127.0.0.1:2345 或 https://协作域名", wsDefault);
-  if (!wsIn || !wsIn.trim()) return;
-  const wsBase = wsIn.trim();
-  saveCollabWsDefault(wsBase);
+  const wsBase = await openCollabSetupDialog();
+  if (!wsBase) return;
   const roomId = "r" + collabRandomHex(12);
   const token = collabRandomHex(32);
   try {
@@ -723,9 +966,14 @@ async function startCollabHostFlow() {
   window.__collabApplyFromY = applyCollabFromY;
   const slots = collectSlotPayload();
   const meta = { pane: loadPaneWeights(), refCol: loadRefColPx(), rows: loadRowWeights() };
-  const sess = window.__collabHostSession(wsBase, roomId, token, { pages: state.pages, slots, meta }, {
-    onSynced: () => updateShareChrome(),
-  });
+  state.collabConnStatus = "connecting";
+  const sess = window.__collabHostSession(
+    wsBase,
+    roomId,
+    token,
+    { pages: state.pages, slots, meta },
+    collabSessionHooks(),
+  );
   state.collabSession = sess;
   state.collabActive = true;
   state.sessionSlots = cloneSlots(slots);
@@ -777,17 +1025,49 @@ function downloadJsonFile(obj, filename) {
 async function copyOrDownloadShare(readOnlyLink) {
   if (!state.pages.length) return;
   const obj = buildShareObject(readOnlyLink);
+  const base = `${location.origin}${location.pathname}${location.search || ""}`;
+  const apiBase = loadCollabWsDefault();
+
+  if (apiBase) {
+    if (location.protocol === "https:" && apiBase.startsWith("http://")) {
+      alert("当前页面为 HTTPS，分享服务地址须为 https://，请检查 collab-config.js 或协作设置。");
+      return;
+    }
+    try {
+      const id = await uploadShareSnapshot(apiBase, obj);
+      const hashPrefix = readOnlyLink ? "share-read=id:" : "share-edit=id:";
+      const full = `${base}#${hashPrefix}${id}`;
+      try {
+        await navigator.clipboard.writeText(full);
+        alert(
+          readOnlyLink
+            ? "已复制「阅读分享」链接。对方打开后仅可浏览，不能编辑或上传。"
+            : "已复制「审核分享」链接。对方打开后可继续编辑参考图与文字。",
+        );
+      } catch (_) {
+        prompt(readOnlyLink ? "请复制「阅读分享」链接：" : "请复制「审核分享」链接：", full);
+      }
+      return;
+    } catch (e) {
+      console.warn("server share upload failed", e);
+      const retry = confirm(
+        "无法上传到分享服务（请确认协作服已部署且可访问）。\n\n是否改用小体积「地址栏链接」或下载 JSON 文件？\n确定 = 继续尝试其它方式，取消 = 中止",
+      );
+      if (!retry) return;
+    }
+  }
+
   const b64 = await encodeShareBundle(obj);
   const prefix = readOnlyLink ? "share-read=" : "share-edit=";
-  const base = `${location.origin}${location.pathname}${location.search || ""}`;
   const full = `${base}#${prefix}${b64}`;
   if (full.length > SHARE_MAX_HASH_CHARS) {
     downloadJsonFile(obj, readOnlyLink ? "分镜阅读分享.json" : "分镜审核分享.json");
     alert(
-      "内容过长，已下载分享包（.json）。\n\n如何自测：\n" +
-        "1）用本地服务打开本页（不要用浏览器直接打开 json 当网页）。\n" +
-        "2）点击顶部「导入分享」，选中刚下载的 json 文件。\n\n" +
-        "说明：用记事本/浏览器打开 json 时，里面会有很长的 data:image… 字段，看起来像乱码，这是正常的图片编码，请始终用「导入分享」加载。",
+      (apiBase ? "分享服务不可用，已" : "内容过长，已") +
+        "下载分享包（.json）。\n\n请让对方用本站「导入分享」打开该文件。\n\n" +
+        (apiBase
+          ? "若已部署 Render 协作服，请确认服务在线并在 collab-config.js 中填写正确 HTTPS 地址。"
+          : "部署协作服后可获得短链接，见 DEPLOY-COLLAB.md。"),
     );
     return;
   }
@@ -795,8 +1075,8 @@ async function copyOrDownloadShare(readOnlyLink) {
     await navigator.clipboard.writeText(full);
     alert(
       readOnlyLink
-        ? "已复制「阅读分享」链接。对方用浏览器打开即可（仅预览）。\n若体积过大无法放进地址栏，会改为下载 JSON，请用「导入分享」打开。\n固定短链需上线后在服务端保存分享数据并由短链跳转本页。"
-        : "已复制「审核分享」链接。对方打开即可继续编辑参考图与文字。\n若体积过大无法放进地址栏，会改为下载 JSON，请用「导入分享」打开。\n固定短链需上线后在服务端保存分享数据并由短链跳转本页。",
+        ? "已复制「阅读分享」链接（内嵌数据，仅适合小文件）。对方打开后仅可浏览。"
+        : "已复制「审核分享」链接（内嵌数据，仅适合小文件）。对方打开后可继续编辑。",
     );
   } catch (_) {
     prompt("请手动复制以下链接：", full);
@@ -806,6 +1086,24 @@ async function copyOrDownloadShare(readOnlyLink) {
 async function tryConsumeShareHash() {
   const raw = location.hash.replace(/^#/, "");
   if (!raw) return false;
+
+  if (raw.startsWith("share-read=id:") || raw.startsWith("share-edit=id:")) {
+    const readOnly = raw.startsWith("share-read=");
+    const apiBase = loadCollabWsDefault();
+    if (!apiBase) {
+      if (els.main) {
+        els.main.innerHTML =
+          '<div class="empty-state empty-state--warn"><p><strong>无法打开分享链接</strong>：本站未配置分享服务（<code>collab-config.js</code> 中的 <code>STORYBOARD_COLLAB_WS</code>）。请让分享方提供 JSON 文件，使用「导入分享」打开。</p></div>';
+      }
+      state.fromShare = true;
+      state.shareReadOnly = true;
+      document.body.classList.add("share-readonly");
+      updateShareChrome();
+      return true;
+    }
+    return openShareFromServerId(apiBase, readOnly);
+  }
+
   let readOnly = null;
   let b64 = null;
   if (raw.startsWith("share-read=")) {
@@ -876,8 +1174,10 @@ function updateShareChrome() {
   if (state.collabActive && !state.fromShare) {
     exit.hidden = true;
     hint.hidden = false;
+    const st = collabStatusLine();
     hint.textContent =
-      "「实时协作」已开启：多人同步编辑当前分镜与参考图。主持人已将编辑/阅读链接发出；编辑链接最多 6 人同时在线，阅读链接人数不限。可继续使用「审核分享 / 阅读分享」导出静态快照。";
+      (st ? st + " " : "") +
+      "「实时协作」已开启：多人同步编辑分镜、参考图与文字；编辑链接最多 6 人，阅读链接人数不限。可用「审核分享」导出静态备份。";
     if (pdfLab instanceof HTMLElement) pdfLab.style.display = "";
     const pi = document.getElementById("pdf-input");
     if (pi) pi.style.display = "";
@@ -893,9 +1193,11 @@ function updateShareChrome() {
     exit.hidden = false;
     hint.hidden = false;
     const collabTag = state.collabActive ? "（实时协作房间）" : "";
+    const st = state.collabActive ? collabStatusLine() : "";
+    const stPrefix = st ? st + " " : "";
     hint.textContent = state.shareReadOnly
-      ? collabTag + "当前为「阅读分享」：可浏览分镜、参考图与文字悬停预览、图片放大；不可编辑或上传。"
-      : collabTag + "当前为「审核分享」：可继续编辑参考图与文字、使用全部预览与布局拖拽；也可再次生成分享。";
+      ? collabTag + stPrefix + "当前为「阅读分享」：可浏览分镜、参考图与文字悬停预览、图片放大；不可编辑或上传。"
+      : collabTag + stPrefix + "当前为「审核分享」：可继续编辑参考图与文字、使用全部预览与布局拖拽；也可再次生成分享。";
     const hideCore = state.shareReadOnly;
     if (pdfLab instanceof HTMLElement) pdfLab.style.display = hideCore ? "none" : "";
     const pi = document.getElementById("pdf-input");

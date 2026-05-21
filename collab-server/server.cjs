@@ -8,6 +8,7 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const WebSocket = require("ws");
 const Y = require("yjs");
 const syncProtocol = require("y-protocols/dist/sync.cjs");
@@ -26,6 +27,75 @@ const MAX_EDITORS = parseInt(process.env.COLLAB_MAX_EDITORS || "6", 10);
 
 /** @type {Map<string, string>} roomId -> token（不含 sb- 前缀） */
 const roomTokens = new Map();
+
+const SHARE_MAX_BYTES = parseInt(process.env.SHARE_MAX_BYTES || String(28 * 1024 * 1024), 10);
+const SHARE_MAX_ENTRIES = parseInt(process.env.SHARE_MAX_ENTRIES || "120", 10);
+const SHARE_TTL_MS = parseInt(process.env.SHARE_TTL_MS || String(7 * 24 * 3600 * 1000), 10);
+
+/** @type {Map<string, { bundle: object, createdAt: number }>} */
+const shareSnapshots = new Map();
+
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+/**
+ * @param {import('http').IncomingMessage} req
+ * @param {import('http').ServerResponse} res
+ * @param {number} maxBytes
+ * @param {(body: string) => void} onBody
+ */
+function readBody(req, res, maxBytes, onBody) {
+  let body = "";
+  let size = 0;
+  req.on("data", (chunk) => {
+    size += chunk.length;
+    if (size > maxBytes) {
+      setCors(res);
+      res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: "payload too large" }));
+      req.destroy();
+      return;
+    }
+    body += chunk;
+  });
+  req.on("end", () => onBody(body));
+  req.on("error", () => {
+    if (!res.headersSent) {
+      setCors(res);
+      res.writeHead(400);
+      res.end(JSON.stringify({ ok: false, error: "bad request" }));
+    }
+  });
+}
+
+function pruneShareSnapshots() {
+  const now = Date.now();
+  for (const [id, row] of shareSnapshots) {
+    if (now - row.createdAt > SHARE_TTL_MS) shareSnapshots.delete(id);
+  }
+  while (shareSnapshots.size > SHARE_MAX_ENTRIES) {
+    const oldest = shareSnapshots.keys().next().value;
+    if (oldest === undefined) break;
+    shareSnapshots.delete(oldest);
+  }
+}
+
+/**
+ * @param {unknown} bundle
+ * @returns {boolean}
+ */
+function isValidShareBundle(bundle) {
+  if (!bundle || typeof bundle !== "object") return false;
+  const b = /** @type {{ v?: number; pages?: unknown }} */ (bundle);
+  return b.v === 1 && Array.isArray(b.pages) && b.pages.length > 0;
+}
+
+function newShareId() {
+  return crypto.randomBytes(12).toString("base64url");
+}
 
 /**
  * @param {Uint8Array} update
@@ -262,22 +332,18 @@ const host = process.env.HOST || "0.0.0.0";
 const port = parseInt(process.env.PORT || "2345", 10);
 
 const server = http.createServer((req, res) => {
+  const url = req.url || "/";
+
   if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    });
+    setCors(res);
+    res.writeHead(204);
     res.end();
     return;
   }
-  if (req.method === "POST" && req.url.startsWith("/api/room")) {
-    let body = "";
-    req.on("data", (c) => {
-      body += c;
-    });
-    req.on("end", () => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
+
+  if (req.method === "POST" && url.startsWith("/api/room")) {
+    readBody(req, res, 65536, (body) => {
+      setCors(res);
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       try {
         const j = JSON.parse(body || "{}");
@@ -298,8 +364,68 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("storyboard-review collab server ok\nPOST /api/room { id, token }\nWS /sb-<id>?token=&role=edit|read\n");
+
+  if (req.method === "POST" && url.startsWith("/api/share")) {
+    readBody(req, res, SHARE_MAX_BYTES, (body) => {
+      setCors(res);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      try {
+        const j = JSON.parse(body || "{}");
+        const bundle = j.bundle;
+        if (!isValidShareBundle(bundle)) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: "invalid bundle" }));
+          return;
+        }
+        pruneShareSnapshots();
+        const id = newShareId();
+        shareSnapshots.set(id, { bundle, createdAt: Date.now() });
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, id }));
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: String(e) }));
+      }
+    });
+    return;
+  }
+
+  const shareGet = url.match(/^\/api\/share\/([a-zA-Z0-9_-]{8,64})\/?$/);
+  if (req.method === "GET" && shareGet) {
+    setCors(res);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    const row = shareSnapshots.get(shareGet[1]);
+    if (!row) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ ok: false, error: "not found" }));
+      return;
+    }
+    if (Date.now() - row.createdAt > SHARE_TTL_MS) {
+      shareSnapshots.delete(shareGet[1]);
+      res.writeHead(404);
+      res.end(JSON.stringify({ ok: false, error: "expired" }));
+      return;
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, bundle: row.bundle }));
+    return;
+  }
+
+  if (req.method === "GET" && (url === "/" || url === "")) {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(
+      "storyboard-review collab server ok\n" +
+        "POST /api/room { id, token }\n" +
+        "POST /api/share { bundle }\n" +
+        "GET  /api/share/<id>\n" +
+        "WS   /sb-<id>?token=&role=edit|read\n",
+    );
+    return;
+  }
+
+  setCors(res);
+  res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ ok: false, error: "not found" }));
 });
 
 const wss = new WebSocket.Server({ noServer: true });
@@ -315,7 +441,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`[collab] http://${host}:${port}  (POST /api/room)`);
+  console.log(`[collab] http://${host}:${port}  (POST /api/room, POST/GET /api/share)`);
   console.log(`[collab] WebSocket  ws://${host}:${port}/sb-<roomId>?token=...&role=edit|read`);
-  console.log(`[collab] 最多 ${MAX_EDITORS} 名编辑；只读连接禁止写入 Yjs Update`);
+  console.log(`[collab] 最多 ${MAX_EDITORS} 名编辑；分享快照最多 ${SHARE_MAX_ENTRIES} 条 / ${SHARE_TTL_MS}ms TTL`);
 });

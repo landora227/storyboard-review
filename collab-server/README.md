@@ -28,6 +28,13 @@ npm start
   房间 id 须为 `8–64` 位 `[a-zA-Z0-9_-]`，口令至少 16 字符。  
   前端主持人在连接 WebSocket **之前**必须先调用此接口注册口令。
 
+- `POST /api/share`  
+  Body（JSON）：`{ "bundle": { "v": 1, "readOnly": false, "pages": [...], "slots": {...}, "meta": {...} } }`  
+  返回 `{ "ok": true, "id": "<分享 id>" }`。用于 **审核分享 / 阅读分享** 短链接（页面 `#share-edit=id:…` / `#share-read=id:…`）。
+
+- `GET /api/share/<id>`  
+  返回 `{ "ok": true, "bundle": { ... } }`。快照默认保留 7 天（`SHARE_TTL_MS`），最多 120 条（`SHARE_MAX_ENTRIES`）。
+
 - `GET /`  
   健康检查，返回纯文本说明。
 

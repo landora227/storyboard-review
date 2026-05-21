@@ -206,6 +206,92 @@ body.gallery-open {
   color: #fff;
 }
 
+.collab-dialog {
+  max-width: 480px;
+  width: calc(100% - 32px);
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-solid);
+  color: var(--text);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.collab-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(4px);
+}
+
+.collab-dialog form {
+  padding: 22px 24px 20px;
+}
+
+.collab-dialog h2 {
+  margin: 0 0 10px;
+  font-size: 1.1rem;
+}
+
+.collab-dialog-lead {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+.collab-dialog-lead code {
+  font-size: 0.82em;
+  color: var(--research);
+}
+
+.collab-dialog-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.collab-dialog-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font: inherit;
+}
+
+.collab-dialog-input:focus {
+  outline: none;
+  border-color: rgba(91, 141, 239, 0.55);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.collab-setup-status {
+  min-height: 1.25em;
+  margin: 10px 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.collab-setup-status--ok {
+  color: var(--apple-green);
+}
+
+.collab-setup-status--err {
+  color: var(--apple-red);
+}
+
+.collab-setup-status--wait {
+  color: var(--apple-teal);
+}
+
+.collab-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 .btn-exit-share {
   border-color: rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.05);

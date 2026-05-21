@@ -1,0 +1,16 @@
+# Render Blueprint：一键部署协作 WebSocket 服务
+# 用法：Render Dashboard → New → Blueprint → 连接本仓库 → 选择此文件
+services:
+  - type: web
+    name: storyboard-review-collab
+    runtime: node
+    rootDir: collab-server
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: COLLAB_MAX_EDITORS
+        value: "6"

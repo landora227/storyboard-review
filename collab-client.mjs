@@ -131,6 +131,59 @@ export function readYDocSnapshot(ydoc) {
  * @param {string} roomId
  * @param {string} token
  */
+/**
+ * @param {string} httpBase
+ * @returns {Promise<boolean>}
+ */
+/**
+ * @param {object} bundle
+ */
+export async function uploadShareSnapshot(httpBase, bundle) {
+  const origin = toHttpOrigin(httpBase);
+  const r = await fetch(`${origin}/api/share`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bundle }),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || `HTTP ${r.status}`);
+  }
+  const j = await r.json();
+  if (!j.ok || typeof j.id !== "string") throw new Error("invalid share response");
+  return j.id;
+}
+
+/**
+ * @param {string} id
+ */
+export async function fetchShareSnapshot(httpBase, id) {
+  const origin = toHttpOrigin(httpBase);
+  const r = await fetch(`${origin}/api/share/${encodeURIComponent(id)}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(t || `HTTP ${r.status}`);
+  }
+  const j = await r.json();
+  if (!j.ok || !j.bundle) throw new Error("share not found");
+  return j.bundle;
+}
+
+export async function pingCollabServer(httpBase) {
+  const origin = toHttpOrigin(httpBase);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(`${origin}/`, { method: "GET", signal: ctrl.signal });
+    const text = await r.text();
+    return r.ok && text.includes("collab server ok");
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function registerRoom(httpBase, roomId, token) {
   const origin = toHttpOrigin(httpBase);
   const r = await fetch(`${origin}/api/room`, {
@@ -325,6 +378,31 @@ function attachSession(ydoc, httpBase, roomId, token, readOnly, hooks) {
     connect: true,
   });
 
+  const closeMessages = {
+    4000: "房间格式错误",
+    4001: "链接无效或房间未注册（请让主持人重新创建房间）",
+    4002: "编辑人数已满（最多 6 人同时编辑，请稍后再试或使用阅读链接）",
+  };
+
+  const onWsClose = (/** @type {CloseEvent} */ ev) => {
+    const msg = closeMessages[/** @type {keyof typeof closeMessages} */ (ev.code)];
+    if (msg) hooks?.onError?.(msg);
+    else if (ev.code !== 1000 && ev.code !== 1001) hooks?.onError?.(`协作连接已断开（${ev.code || "未知"}）`);
+  };
+
+  const wireWsClose = () => {
+    if (provider.ws && !provider.ws.dataset.collabCloseWired) {
+      provider.ws.dataset.collabCloseWired = "1";
+      provider.ws.addEventListener("close", onWsClose);
+    }
+  };
+
+  provider.on("status", (/** @type {{ status: string }} */ e) => {
+    hooks?.onStatus?.(e.status);
+    if (e.status === "connected") wireWsClose();
+  });
+  hooks?.onStatus?.("connecting");
+
   observeDocAndNotify(ydoc, readOnly);
 
   let unwireText = () => {};
@@ -390,6 +468,9 @@ export function notifyLayoutChangedFromDom() {
 
 window.__collabPrimeYDoc = primeYDoc;
 window.__collabReadYDoc = readYDocSnapshot;
+window.__collabPingServer = pingCollabServer;
+window.__collabUploadShare = uploadShareSnapshot;
+window.__collabFetchShare = fetchShareSnapshot;
 window.__collabRegisterRoom = registerRoom;
 window.__collabHostSession = hostCollabSession;
 window.__collabJoinSession = joinCollabSession;
