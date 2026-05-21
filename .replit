@@ -1,0 +1,12 @@
+# 从 GitHub 导入整个 storyboard-review 仓库时，Replit 用此配置启动协作后台
+modules = ["nodejs-20"]
+
+[run]
+command = "cd collab-server && npm install && npm start"
+
+[deployment]
+run = ["sh", "-c", "cd collab-server && npm install && npm start"]
+deploymentTarget = "autoscale"
+
+[env]
+HOST = "0.0.0.0"

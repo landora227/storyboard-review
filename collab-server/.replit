@@ -1,0 +1,11 @@
+modules = ["nodejs-20"]
+
+[run]
+command = "npm install && npm start"
+
+[deployment]
+run = ["sh", "-c", "npm install && npm start"]
+deploymentTarget = "autoscale"
+
+[env]
+HOST = "0.0.0.0"
