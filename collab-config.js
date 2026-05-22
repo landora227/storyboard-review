@@ -1,6 +1,6 @@
 /**
- * 公网协作服务地址（HTTPS，无末尾斜杠）。
- * 在 Render 等平台部署 collab-server 后，把下方改成你的服务 URL。
- * 详见 DEPLOY-COLLAB.md
+ * 公网协作/分享后台地址（HTTPS，无末尾斜杠）。
+ * Replit 外网若打不开，可暂时改为 ""，将使用 JSON 文件分享。
+ * 详见 DEPLOY-COLLAB.md、DEPLOY-REPLIT.md
  */
-window.STORYBOARD_COLLAB_WS = https://2d638136-6791-49b1-a08f-e365243c51ad-00-2mj73nyn6gxck.sisko.replit.dev:8000/
+window.STORYBOARD_COLLAB_WS = "";
