@@ -9,9 +9,12 @@ const LS_PANE = "storyboard-pane-weights";
 const LS_REF_COL = "storyboard-ref-col-px";
 const LS_ROW = "storyboard-row-weights";
 const LS_COLLAB_WS = "storyboard-collab-ws-base";
+const SS_REALTIME_SHARE = "storyboard-realtime-shareId"; // sessionStorage key
 
 const state = {
   pages: /** @type {{ pageIndex: number; pageUrl: string }[]} */ ([]),
+  /** 退出分享页时保存的 pages，用于「重新打开」恢复 */
+  sessionPages: /** @type {{ pageIndex: number; pageUrl: string }[]} */ ([]),
   /** @type {string | null} */
   currentArchiveId: null,
   /** @type {File | null} */
@@ -35,10 +38,16 @@ const state = {
   collabActive: false,
   /** @type {{ destroy: () => void, ydoc?: import("yjs").Doc } | null} */
   collabSession: null,
-  /** @type {"connecting" | "connected" | "disconnected" | null} */
-  collabConnStatus: null,
-  /** @type {string | null} */
-  collabConnError: null,
+  /** Firebase 实时协作：当前 shareId（审核分享链接的 ID） */
+  realtimeShareId: /** @type {string | null} */ (null),
+  /** Firebase 实时协作：SSE 监听器（EventSource） */
+  realtimeEventSource: /** @type {EventSource | null} */ (null),
+  /** Firebase 实时协作：在线人数 */
+  realtimeOnlineCount: 0,
+  /** Firebase 实时协作：当前用户唯一 ID */
+  realtimeUid: /** @type {string | null} */ (null),
+  /** Firebase 实时协作：防抖 timer */
+  realtimeSyncTimer: /** @type {ReturnType<typeof setTimeout> | null} */ (null),
 };
 
 const pdfJsReady = typeof pdfjsLib !== "undefined";
@@ -193,6 +202,7 @@ async function loadPdf(file) {
     state.shareReadOnly = false;
     document.body.classList.remove("share-readonly");
     state.pages = await parsePdfToPages(data);
+    state.sessionPages = state.pages.slice(); // 保存页面用于「重新打开」
     renderBoard();
     updateShareChrome();
     await persistNewArchiveFromImport(file);
@@ -268,6 +278,10 @@ function scheduleAutosave() {
     autosaveTimer = 0;
     void flushAutosaveOnce();
   }, 650);
+  // 实时协作：同步到 Firebase（debounce 1s，在 flushAutosaveOnce 之后）
+  if (state.realtimeShareId && !state.shareReadOnly && !state._applyingRemote) {
+    triggerRealtimeSync();
+  }
 }
 
 /** 将当前编辑区写入 sessionSlots，并在有归档 id 时写入 IndexedDB */
@@ -496,7 +510,9 @@ function applySharePayloadToState(data, readOnly) {
   state.fromShare = true;
   state.shareReadOnly = readOnly || !!d.readOnly;
   state.currentArchiveId = null;
-  state.lastPdfFile = null;
+  // 从分享数据中提取名称，用于「继续编辑」按钮显示
+  const shareName = (d.meta && d.meta.pdfName) || d.archiveName || null;
+  state.lastPdfFile = shareName ? { name: shareName } : null;
   state.pendingShareSlots = d.slots && typeof d.slots === "object" ? d.slots : null;
   if (d.meta && typeof d.meta === "object") {
     const m = d.meta;
@@ -598,104 +614,13 @@ function destroyCollabSessionLocal() {
   }
   state.collabSession = null;
   state.collabActive = false;
-  state.collabConnStatus = null;
-  state.collabConnError = null;
   delete window.__collabGetMeta;
   delete window.__collabApplyFromY;
-}
-
-/** @param {"connecting" | "connected" | "disconnected"} status */
-function onCollabProviderStatus(status) {
-  state.collabConnStatus = status;
-  state.collabConnError = null;
-  updateShareChrome();
-}
-
-/** @param {string} message */
-function onCollabProviderError(message) {
-  state.collabConnStatus = "disconnected";
-  state.collabConnError = message;
-  updateShareChrome();
-}
-
-/** @returns {Record<string, () => void>} */
-function collabSessionHooks(extra) {
-  return {
-    onStatus: onCollabProviderStatus,
-    onError: onCollabProviderError,
-    onSynced: () => {
-      state.collabConnStatus = "connected";
-      state.collabConnError = null;
-      updateShareChrome();
-      extra?.onSynced?.();
-    },
-  };
-}
-
-function collabStatusLine() {
-  if (state.collabConnError) return `协作：${state.collabConnError}`;
-  if (state.collabConnStatus === "connecting") return "协作：正在连接…";
-  if (state.collabConnStatus === "disconnected") return "协作：已断开，请检查网络或协作服务是否在线。";
-  if (state.collabConnStatus === "connected") return "协作：已连接，编辑实时同步中。";
-  return "";
 }
 
 /**
  * @returns {Promise<boolean>}
  */
-/**
- * @param {string} apiBase
- * @param {boolean} readOnly
- */
-async function openShareFromServerId(apiBase, readOnly) {
-  const raw = location.hash.replace(/^#/, "");
-  const prefix = readOnly ? "share-read=id:" : "share-edit=id:";
-  if (!raw.startsWith(prefix)) return false;
-  const id = raw.slice(prefix.length).trim();
-  if (!id || !/^[a-zA-Z0-9_-]{8,64}$/.test(id)) return false;
-
-  if (window.location.protocol === "https:" && apiBase.startsWith("http://")) {
-    if (els.main) {
-      els.main.innerHTML =
-        '<div class="empty-state empty-state--warn"><p><strong>无法打开分享</strong>：当前页面为 HTTPS，分享服务地址须为 <code>https://</code>。</p></div>';
-    }
-    state.fromShare = true;
-    state.shareReadOnly = true;
-    document.body.classList.add("share-readonly");
-    return true;
-  }
-
-  if (els.main) {
-    els.main.innerHTML = '<div class="loading"><div class="spinner"></div><span>正在加载分享内容…</span></div>';
-  }
-  try {
-    const data = await fetchShareSnapshot(apiBase, id);
-    applySharePayloadToState(data, readOnly);
-    showEditorView();
-    applyAllLayoutGlobals();
-    renderBoard();
-    const shareSlots = state.pendingShareSlots;
-    if (shareSlots) {
-      applySlotPayload(shareSlots);
-      state.sessionSlots = cloneSlots(shareSlots);
-      state.pendingShareSlots = null;
-    }
-    updateShareChrome();
-    return true;
-  } catch (e) {
-    console.error(e);
-    state.fromShare = true;
-    state.shareReadOnly = true;
-    if (els.main) {
-      els.main.innerHTML =
-        '<div class="empty-state empty-state--warn"><p><strong>无法加载分享</strong>：链接已过期、服务未启动，或 <code>collab-config.js</code> 中的服务地址不正确。</p></div>';
-    }
-    document.body.classList.add("share-readonly");
-    updateShareChrome();
-    return true;
-  }
-}
-
 async function tryConsumeCollabHash() {
   const raw = location.hash.replace(/^#/, "");
   if (!raw.startsWith("collab-v1=")) return false;
@@ -756,171 +681,20 @@ async function tryConsumeCollabHash() {
     rows: loadRowWeights(),
   });
   window.__collabApplyFromY = applyCollabFromY;
-  state.collabConnStatus = "connecting";
-  const sess = window.__collabJoinSession(L.ws, L.room, L.token, readOnly, collabSessionHooks());
+  const sess = window.__collabJoinSession(L.ws, L.room, L.token, readOnly, {
+    onSynced: () => updateShareChrome(),
+  });
   state.collabSession = sess;
   return true;
 }
 
 function loadCollabWsDefault() {
-  const cfg =
-    typeof window.STORYBOARD_COLLAB_WS === "string" && window.STORYBOARD_COLLAB_WS.trim()
-      ? window.STORYBOARD_COLLAB_WS.trim()
-      : "";
-  if (cfg) return cfg;
   try {
     const s = localStorage.getItem(LS_COLLAB_WS);
-    if (s && s.trim()) return s.trim();
+    return s && s.trim() ? s.trim() : "http://127.0.0.1:2345";
   } catch (_) {
-    /* ignore */
-  }
-  if (location.hostname === "localhost" || location.hostname === "127.0.0.1") {
     return "http://127.0.0.1:2345";
   }
-  return "";
-}
-
-/** @param {string} httpBase */
-function collabHttpOrigin(httpBase) {
-  const b = httpBase.trim().replace(/\/$/, "");
-  if (b.startsWith("ws://")) return `http://${b.slice(5)}`;
-  if (b.startsWith("wss://")) return `https://${b.slice(6)}`;
-  return b;
-}
-
-/**
- * @param {string} apiBase
- * @param {object} bundle
- * @returns {Promise<string>}
- */
-async function uploadShareSnapshot(apiBase, bundle) {
-  const origin = collabHttpOrigin(apiBase);
-  const r = await fetch(`${origin}/api/share`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bundle }),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || `HTTP ${r.status}`);
-  }
-  const j = await r.json();
-  if (!j.ok || typeof j.id !== "string") throw new Error("invalid share response");
-  return j.id;
-}
-
-/**
- * @param {string} apiBase
- * @param {string} id
- */
-async function fetchShareSnapshot(apiBase, id) {
-  const origin = collabHttpOrigin(apiBase);
-  const r = await fetch(`${origin}/api/share/${encodeURIComponent(id)}`);
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || `HTTP ${r.status}`);
-  }
-  const j = await r.json();
-  if (!j.ok || !j.bundle) throw new Error("share not found");
-  return j.bundle;
-}
-
-/**
- * @returns {Promise<string | null>}
- */
-async function openCollabSetupDialog() {
-  const dlg = document.getElementById("collab-setup-dialog");
-  const input = document.getElementById("collab-ws-input");
-  const statusEl = document.getElementById("collab-setup-status");
-  const testBtn = document.getElementById("collab-test-btn");
-  if (!(dlg instanceof HTMLDialogElement) || !(input instanceof HTMLInputElement)) {
-    const wsDefault = loadCollabWsDefault() || "http://127.0.0.1:2345";
-    const wsIn = prompt(
-      "协作服务器 HTTP 根地址（需已运行 collab-server）\n示例：https://storyboard-review-collab.onrender.com",
-      wsDefault,
-    );
-    return wsIn && wsIn.trim() ? wsIn.trim() : null;
-  }
-
-  input.value = loadCollabWsDefault() || "http://127.0.0.1:2345";
-  if (statusEl) {
-    statusEl.textContent = "";
-    statusEl.className = "collab-setup-status";
-  }
-
-  const setStatus = (text, kind = "") => {
-    if (!statusEl) return;
-    statusEl.textContent = text;
-    statusEl.className = "collab-setup-status" + (kind ? ` collab-setup-status--${kind}` : "");
-  };
-
-  const testHandler = async () => {
-    const base = input.value.trim();
-    if (!base) {
-      setStatus("请填写协作服务器地址。", "err");
-      return;
-    }
-    if (location.protocol === "https:" && base.startsWith("http://")) {
-      setStatus("当前页面为 HTTPS，协作地址须为 https://（不能填 http://）。", "err");
-      return;
-    }
-    setStatus("正在测试连接…", "wait");
-    try {
-      await ensureCollabModule();
-      const ok = await window.__collabPingServer?.(base);
-      setStatus(ok ? "连接成功，可以创建房间。" : "无法连接：请确认协作服已部署且地址正确。", ok ? "ok" : "err");
-    } catch (e) {
-      setStatus(String(/** @type {Error} */ (e).message || e), "err");
-    }
-  };
-
-  if (testBtn) {
-    testBtn.onclick = () => void testHandler();
-  }
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (/** @type {string | null} */ val) => {
-      if (settled) return;
-      settled = true;
-      if (testBtn) testBtn.onclick = null;
-      dlg.removeEventListener("close", onClose);
-      document.getElementById("collab-setup-form")?.removeEventListener("submit", onSubmit);
-      document.getElementById("collab-cancel-btn")?.removeEventListener("click", onCancel);
-      resolve(val);
-    };
-
-    const onCancel = () => {
-      if (dlg.open) dlg.close("cancel");
-      else finish(null);
-    };
-
-    const onClose = () => {
-      if (dlg.returnValue === "host") return;
-      finish(null);
-    };
-
-    const onSubmit = (/** @type {Event} */ e) => {
-      e.preventDefault();
-      const base = input.value.trim();
-      if (!base) {
-        setStatus("请填写协作服务器地址。", "err");
-        return;
-      }
-      if (location.protocol === "https:" && base.startsWith("http://")) {
-        setStatus("当前页面为 HTTPS，协作地址须为 https://。", "err");
-        return;
-      }
-      saveCollabWsDefault(base);
-      dlg.close("host");
-      finish(base);
-    };
-
-    dlg.addEventListener("close", onClose);
-    document.getElementById("collab-setup-form")?.addEventListener("submit", onSubmit);
-    document.getElementById("collab-cancel-btn")?.addEventListener("click", onCancel);
-    dlg.showModal();
-  });
 }
 
 function saveCollabWsDefault(ws) {
@@ -946,8 +720,11 @@ async function startCollabHostFlow() {
     alert("请先导入 PDF 分镜后再开启协作。");
     return;
   }
-  const wsBase = await openCollabSetupDialog();
-  if (!wsBase) return;
+  const wsDefault = loadCollabWsDefault();
+  const wsIn = prompt("协作服务器 HTTP 根地址（需已运行 collab-server，含端口）\n示例：http://127.0.0.1:2345 或 https://协作域名", wsDefault);
+  if (!wsIn || !wsIn.trim()) return;
+  const wsBase = wsIn.trim();
+  saveCollabWsDefault(wsBase);
   const roomId = "r" + collabRandomHex(12);
   const token = collabRandomHex(32);
   try {
@@ -966,14 +743,9 @@ async function startCollabHostFlow() {
   window.__collabApplyFromY = applyCollabFromY;
   const slots = collectSlotPayload();
   const meta = { pane: loadPaneWeights(), refCol: loadRefColPx(), rows: loadRowWeights() };
-  state.collabConnStatus = "connecting";
-  const sess = window.__collabHostSession(
-    wsBase,
-    roomId,
-    token,
-    { pages: state.pages, slots, meta },
-    collabSessionHooks(),
-  );
+  const sess = window.__collabHostSession(wsBase, roomId, token, { pages: state.pages, slots, meta }, {
+    onSynced: () => updateShareChrome(),
+  });
   state.collabSession = sess;
   state.collabActive = true;
   state.sessionSlots = cloneSlots(slots);
@@ -1001,7 +773,8 @@ function exitCollabOnly() {
 
 function buildShareObject(readOnly) {
   const slots = collectSlotPayload();
-  const meta = { pane: loadPaneWeights(), refCol: loadRefColPx(), rows: loadRowWeights() };
+  const pdfName = state.lastPdfFile ? state.lastPdfFile.name.replace(/\.pdf$/i, "") : "";
+  const meta = { pane: loadPaneWeights(), refCol: loadRefColPx(), rows: loadRowWeights(), pdfName };
   return { v: SHARE_BUNDLE_V, readOnly, pages: state.pages, slots, meta };
 }
 
@@ -1023,87 +796,448 @@ function downloadJsonFile(obj, filename) {
  * @param {boolean} readOnlyLink true = 阅读分享
  */
 async function copyOrDownloadShare(readOnlyLink) {
-  if (!state.pages.length) return;
-  const obj = buildShareObject(readOnlyLink);
-  const base = `${location.origin}${location.pathname}${location.search || ""}`;
-  const apiBase = loadCollabWsDefault();
+  await shareViaFirebase(readOnlyLink ? "readonly" : "edit");
+}
 
-  if (apiBase) {
-    if (location.protocol === "https:" && apiBase.startsWith("http://")) {
-      alert("当前页面为 HTTPS，分享服务地址须为 https://，请检查 collab-config.js 或协作设置。");
-      return;
-    }
+/**
+ * 显示分享链接弹窗（替代 alert）
+ */
+function showShareLinkDialog(shareUrl) {
+  // 移除旧弹窗
+  document.getElementById("share-link-dialog")?.remove();
+
+  const dialog = document.createElement("div");
+  dialog.id = "share-link-dialog";
+  dialog.style.cssText = `
+    position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999;
+    display:flex; align-items:center; justify-content:center;
+  `;
+  dialog.innerHTML = `
+    <div style="background:#fff; border-radius:12px; padding:28px 32px; min-width:360px; max-width:560px; box-shadow:0 8px 40px rgba(0,0,0,.18); font-family:inherit;">
+      <div style="font-size:15px; color:#555; margin-bottom:12px;">分享链接</div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <a id="sld-link" href="${shareUrl}" target="_blank" rel="noopener"
+           style="flex:1; font-size:13px; color:#1a73e8; word-break:break-all; text-decoration:none; border:1px solid #d0d0d0; border-radius:6px; padding:8px 10px; background:#f8f9fa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; display:block;"
+           title="${shareUrl}">${shareUrl}</a>
+        <button id="sld-copy" style="flex-shrink:0; padding:8px 14px; background:#1a73e8; color:#fff; border:none; border-radius:6px; cursor:pointer; font-size:13px; white-space:nowrap;">复制</button>
+      </div>
+      <div style="text-align:right; margin-top:18px;">
+        <button id="sld-close" style="padding:7px 18px; background:#f1f3f4; border:none; border-radius:6px; cursor:pointer; font-size:13px;">关闭</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(dialog);
+
+  const copyBtn = dialog.querySelector("#sld-copy");
+  copyBtn.addEventListener("click", async () => {
     try {
-      const id = await uploadShareSnapshot(apiBase, obj);
-      const hashPrefix = readOnlyLink ? "share-read=id:" : "share-edit=id:";
-      const full = `${base}#${hashPrefix}${id}`;
-      try {
-        await navigator.clipboard.writeText(full);
-        alert(
-          readOnlyLink
-            ? "已复制「阅读分享」链接。对方打开后仅可浏览，不能编辑或上传。"
-            : "已复制「审核分享」链接。对方打开后可继续编辑参考图与文字。",
-        );
-      } catch (_) {
-        prompt(readOnlyLink ? "请复制「阅读分享」链接：" : "请复制「审核分享」链接：", full);
-      }
-      return;
-    } catch (e) {
-      console.warn("server share upload failed", e);
-      const retry = confirm(
-        "无法上传到分享服务（请确认协作服已部署且可访问）。\n\n是否改用小体积「地址栏链接」或下载 JSON 文件？\n确定 = 继续尝试其它方式，取消 = 中止",
-      );
-      if (!retry) return;
+      await navigator.clipboard.writeText(shareUrl);
+      copyBtn.textContent = "已复制 ✓";
+      copyBtn.style.background = "#34a853";
+      setTimeout(() => { copyBtn.textContent = "复制"; copyBtn.style.background = "#1a73e8"; }, 2000);
+    } catch (_) {
+      // fallback
+      const ta = document.createElement("textarea");
+      ta.value = shareUrl;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      copyBtn.textContent = "已复制 ✓";
+      copyBtn.style.background = "#34a853";
+      setTimeout(() => { copyBtn.textContent = "复制"; copyBtn.style.background = "#1a73e8"; }, 2000);
     }
+  });
+
+  const close = () => dialog.remove();
+  dialog.querySelector("#sld-close").addEventListener("click", close);
+  dialog.addEventListener("click", (e) => { if (e.target === dialog) close(); });
+}
+
+// ─────────────────────────────────────────────
+// 实时协作模块（基于 Firebase REST API + SSE）
+// ─────────────────────────────────────────────
+
+/** 获取 Firebase databaseURL */
+function getDbUrl() {
+  if (typeof firebaseConfig !== "undefined" && firebaseConfig.databaseURL) {
+    return firebaseConfig.databaseURL.replace(/\/$/, "");
+  }
+  try { return firebase.app().options.databaseURL.replace(/\/$/, ""); } catch(_) {}
+  return "";
+}
+
+/** 生成随机 UID */
+function genUid() {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+/**
+ * 启动实时协作：监听 Firebase SSE，发布 presence
+ * @param {string} shareId
+ * @param {boolean} readOnly
+ */
+function startRealtimeCollab(shareId, readOnly) {
+  if (state.realtimeShareId === shareId) return; // 已经在监听
+  stopRealtimeCollab();
+
+  const dbUrl = getDbUrl();
+  if (!dbUrl) return;
+
+  state.realtimeShareId = shareId;
+  state.realtimeUid = genUid();
+  // 持久化 shareId 到 sessionStorage，页面刷新后可恢复
+  try { sessionStorage.setItem(SS_REALTIME_SHARE, shareId); } catch(_) {}
+  console.log("[实时协作] startRealtimeCollab uid=", state.realtimeUid, "shareId=", shareId);
+
+  // 1. SSE 监听 collab/slots 变化（Firebase Streaming API）
+  const slotsUrl = dbUrl + "/shares/" + shareId + "/collab/slots.json";
+  try {
+    const es = new EventSource(slotsUrl);
+    state.realtimeEventSource = es;
+
+    es.addEventListener("put", (e) => {
+      try {
+        const payload = JSON.parse(/** @type {MessageEvent} */ (e).data);
+        if (!payload || payload.path === null) return;
+        const slots = payload.data;
+        if (!slots || typeof slots !== "object") return;
+        // 忽略自己的更新（通过 _uid 判断）
+        if (slots._uid === state.realtimeUid) return;
+        console.log("[实时协作] 收到更新，路径:", payload.path, "keys:", Object.keys(slots).slice(0,3));
+        // 检查 DOM 是否已准备好（至少有一个 dropzone 元素）
+        const hasDom = !!document.querySelector("[data-dropzone]");
+        if (!hasDom) {
+          // DOM 未就绪，存入 pendingShareSlots，等渲染后应用
+          console.log("[实时协作] DOM 未就绪，存入 pending");
+          state.pendingShareSlots = slots;
+          return;
+        }
+        // 应用远端 slots 到当前界面（不触发二次同步）
+        state._applyingRemote = true;
+        applySlotPayload(slots);
+        state._applyingRemote = false;
+        showRealtimeToast("已同步协作方的最新修改");
+        console.log("[实时协作] 已应用更新");
+      } catch (err) {
+        console.warn("[实时协作] 解析失败：", err);
+      }
+    });
+
+    es.onerror = () => {
+      // SSE 断线后 EventSource 会自动重连，不需要手动处理
+    };
+  } catch (err) {
+    console.warn("[实时协作] SSE 启动失败：", err);
   }
 
-  const b64 = await encodeShareBundle(obj);
-  const prefix = readOnlyLink ? "share-read=" : "share-edit=";
-  const full = `${base}#${prefix}${b64}`;
-  if (full.length > SHARE_MAX_HASH_CHARS) {
-    downloadJsonFile(obj, readOnlyLink ? "分镜阅读分享.json" : "分镜审核分享.json");
-    alert(
-      (apiBase ? "分享服务不可用，已" : "内容过长，已") +
-        "下载分享包（.json）。\n\n请让对方用本站「导入分享」打开该文件。\n\n" +
-        (apiBase
-          ? "若已部署 Render 协作服，请确认服务在线并在 collab-config.js 中填写正确 HTTPS 地址。"
-          : "部署协作服后可获得短链接，见 DEPLOY-COLLAB.md。"),
-    );
+  // 2. 写入 presence（所有用户，含只读，均写入以显示在线人数）
+  writePresence(shareId, state.realtimeUid, true);
+  // 每 30 秒更新一次 heartbeat
+  const heartbeatTimer = setInterval(() => {
+    if (state.realtimeShareId === shareId) {
+      writePresence(shareId, state.realtimeUid, true);
+    } else {
+      clearInterval(heartbeatTimer);
+    }
+  }, 30000);
+
+  // 3. 监听 presence（在线人数）
+  watchPresence(shareId);
+
+  console.log("[实时协作] 已启动，shareId:", shareId, "uid:", state.realtimeUid);
+}
+
+/** 停止实时协作，清理所有监听 */
+function stopRealtimeCollab() {
+  console.log("[实时协作] stopRealtimeCollab called, current shareId=", state.realtimeShareId);
+  if (state.realtimeEventSource) {
+    state.realtimeEventSource.close();
+    // 同时关闭附属的 presence SSE
+    if (/** @type {any} */ (state.realtimeEventSource)._presEs) {
+      /** @type {any} */ (state.realtimeEventSource)._presEs.close();
+    }
+    state.realtimeEventSource = null;
+  }
+  if (state.realtimeSyncTimer) {
+    clearTimeout(state.realtimeSyncTimer);
+    state.realtimeSyncTimer = null;
+  }
+  // 离线 presence
+  if (state.realtimeShareId && state.realtimeUid) {
+    writePresence(state.realtimeShareId, state.realtimeUid, false);
+  }
+  // 清除 sessionStorage 里的 shareId
+  try { sessionStorage.removeItem(SS_REALTIME_SHARE); } catch(_) {}
+  state.realtimeShareId = null;
+  state.realtimeUid = null;
+  state.realtimeOnlineCount = 0;
+  updateRealtimeIndicator();
+}
+
+/**
+ * 写入 presence（在线/离线）
+ * @param {string} shareId
+ * @param {string} uid
+ * @param {boolean} online
+ */
+async function writePresence(shareId, uid, online) {
+  const dbUrl = getDbUrl();
+  if (!dbUrl || !uid) return;
+  const url = dbUrl + "/shares/" + shareId + "/presence/" + uid + ".json";
+  try {
+    if (online) {
+      await fetch(url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ts: Date.now() })
+      });
+    } else {
+      await fetch(url, { method: "DELETE" });
+    }
+  } catch (_) {}
+}
+
+/** 监听 presence 路径，更新在线人数显示 */
+function watchPresence(shareId) {
+  const dbUrl = getDbUrl();
+  if (!dbUrl) return;
+  const presUrl = dbUrl + "/shares/" + shareId + "/presence.json";
+
+  /** 从全量 presence 数据计算在线人数 */
+  function countOnline(data) {
+    if (!data || typeof data !== "object") return 0;
+    const now = Date.now();
+    return Object.values(data).filter(
+      (e) => e && /** @type {any} */ (e).ts && (now - /** @type {any} */ (e).ts) < 120000
+    ).length;
+  }
+
+  /** 本地缓存的 presence 数据（用于 patch 增量更新） */
+  let presenceCache = /** @type {Record<string, any>} */ ({});
+
+  try {
+    const presEs = new EventSource(presUrl);
+
+    // put = 全量数据（初始化或全量替换）
+    presEs.addEventListener("put", (e) => {
+      try {
+        const payload = JSON.parse(/** @type {MessageEvent} */ (e).data);
+        if (payload.path === "/") {
+          presenceCache = payload.data || {};
+        } else {
+          const key = payload.path.replace(/^\//, "");
+          if (payload.data === null) {
+            delete presenceCache[key];
+          } else {
+            presenceCache[key] = payload.data;
+          }
+        }
+        state.realtimeOnlineCount = countOnline(presenceCache);
+        updateRealtimeIndicator();
+      } catch (_) {}
+    });
+
+    // patch = 增量更新（某个用户加入/离开/心跳）
+    presEs.addEventListener("patch", (e) => {
+      try {
+        const payload = JSON.parse(/** @type {MessageEvent} */ (e).data);
+        const data = payload && payload.data;
+        if (data && typeof data === "object") {
+          Object.assign(presenceCache, data);
+          // null 值表示删除
+          for (const [k, v] of Object.entries(data)) {
+            if (v === null) delete presenceCache[k];
+          }
+        }
+        state.realtimeOnlineCount = countOnline(presenceCache);
+        updateRealtimeIndicator();
+      } catch (_) {}
+    });
+    // 把 presEs 也存起来，退出时关闭
+    if (!state.realtimeEventSource) {
+      state.realtimeEventSource = presEs;
+    } else {
+      // 附加到 eventSource 上以便统一关闭
+      /** @type {any} */ (state.realtimeEventSource)._presEs = presEs;
+    }
+  } catch (_) {}
+}
+
+/** 更新界面右上角在线人数指示器 */
+function updateRealtimeIndicator() {
+  let indicator = document.getElementById("realtime-indicator");
+  if (!state.realtimeShareId || state.realtimeOnlineCount === 0) {
+    if (indicator) indicator.style.display = "none";
     return;
   }
-  try {
-    await navigator.clipboard.writeText(full);
-    alert(
-      readOnlyLink
-        ? "已复制「阅读分享」链接（内嵌数据，仅适合小文件）。对方打开后仅可浏览。"
-        : "已复制「审核分享」链接（内嵌数据，仅适合小文件）。对方打开后可继续编辑。",
-    );
-  } catch (_) {
-    prompt("请手动复制以下链接：", full);
+  if (!indicator) {
+    indicator = document.createElement("div");
+    indicator.id = "realtime-indicator";
+    indicator.style.cssText = "position:fixed;bottom:16px;right:16px;background:#1a73e8;color:#fff;padding:6px 14px;border-radius:20px;font-size:13px;z-index:999;box-shadow:0 2px 8px rgba(0,0,0,.2);pointer-events:none;";
+    document.body.appendChild(indicator);
   }
+  indicator.style.display = "";
+  indicator.textContent = "🟢 " + state.realtimeOnlineCount + " 人在线协作";
+}
+
+/** 显示短暂提示（右下角） */
+function showRealtimeToast(msg) {
+  const toast = document.createElement("div");
+  toast.style.cssText = "position:fixed;bottom:56px;right:16px;background:#333;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;z-index:1000;opacity:0;transition:opacity .3s;pointer-events:none;";
+  toast.textContent = msg;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => { toast.style.opacity = "1"; });
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+
+/**
+ * 触发实时同步（debounce 1秒）：把当前 slots 推送到 Firebase
+ */
+function triggerRealtimeSync() {
+  if (!state.realtimeShareId || state.shareReadOnly || state._applyingRemote) return;
+  if (state.realtimeSyncTimer) clearTimeout(state.realtimeSyncTimer);
+  state.realtimeSyncTimer = setTimeout(() => {
+    state.realtimeSyncTimer = null;
+    void pushRealtimeSlots();
+  }, 1000);
+}
+
+/** 将当前 slots 推送到 Firebase */
+async function pushRealtimeSlots() {
+  if (!state.realtimeShareId) return;
+  const dbUrl = getDbUrl();
+  if (!dbUrl) return;
+  const slots = collectSlotPayload();
+  slots._uid = state.realtimeUid; // 标记来源，避免自己收到自己的更新
+  const url = dbUrl + "/shares/" + state.realtimeShareId + "/collab/slots.json";
+  try {
+    await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(slots)
+    });
+  } catch (err) {
+    console.warn("[实时协作] 推送失败：", err);
+  }
+}
+
+// ─────────────────────────────────────────────
+
+/**
+ * 将当前项目上传到 Firebase Realtime Database，生成短链并复制到剪贴板
+ * @param {"edit" | "readonly"} mode
+ */
+async function shareViaFirebase(mode) {
+  if (!state.pages.length) {
+    alert("请先导入 PDF 分镜后再生成分享链接。");
+    return;
+  }
+  const readOnly = mode === "readonly";
+  const obj = buildShareObject(readOnly);
+
+  // 获取 Firebase databaseURL（优先从 firebaseConfig，其次从已初始化的 app）
+  let dbUrl = "";
+  if (typeof firebaseConfig !== "undefined" && firebaseConfig.databaseURL) {
+    dbUrl = firebaseConfig.databaseURL.replace(/\/$/, "");
+  } else if (typeof firebase !== "undefined") {
+    try { dbUrl = firebase.app().options.databaseURL.replace(/\/$/, ""); } catch(_) {}
+  }
+
+  if (!dbUrl) {
+    console.warn("[分享] 找不到 Firebase databaseURL，降级为下载 JSON");
+    downloadJsonFile(obj, readOnly ? "分镜阅读分享.json" : "分镜审核分享.json");
+    alert("Firebase 配置未找到，已将分享内容下载为 JSON 文件。\n你可以把这个文件发给对方，对方用「导入备份」打开。");
+    return;
+  }
+
+  // 生成 8 位随机 ID
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let shareId = "";
+  for (let i = 0; i < 8; i++) shareId += chars[Math.floor(Math.random() * chars.length)];
+
+  const btnId = mode === "readonly" ? "btn-share-read" : "btn-share-edit";
+  const btn = document.getElementById(btnId);
+  const origText = btn ? btn.textContent : "";
+  if (btn) { btn.textContent = "上传中…"; btn.disabled = true; }
+
+  try {
+    // 使用 Firebase REST API（不依赖 SDK，不受 CDN 加载失败影响）
+    const restUrl = dbUrl + "/shares/" + shareId + ".json";
+    const payload = JSON.stringify({
+      data: JSON.stringify(obj),
+      createdAt: Date.now(),
+      mode: mode
+    });
+
+    console.log("[分享] 正在上传到:", restUrl);
+    const resp = await fetch(restUrl, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: payload
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error("HTTP " + resp.status + ": " + errText);
+    }
+
+    const base = window.location.href.split("?")[0].split("#")[0];
+    const shareUrl = base + "?share=" + shareId + "&mode=" + mode;
+    console.log("[分享] 上传成功，链接:", shareUrl);
+
+    if (btn) { btn.textContent = origText; btn.disabled = false; }
+
+    // 审核分享：生成链接后启动实时协作（作为"发起方"）
+    if (mode === "edit") {
+      startRealtimeCollab(shareId, false);
+    }
+
+    showShareLinkDialog(shareUrl);
+  } catch (err) {
+    console.error("[分享] 上传失败：", err);
+    if (btn) { btn.textContent = origText; btn.disabled = false; }
+    alert("上传分享失败：" + String(err.message || err) + "\n\n请检查：\n1. Firebase Realtime Database 安全规则是否允许写入\n2. 网络是否正常\n\n规则设置：Firebase 控制台 → Realtime Database → 规则 → 改为 {rules: {.read: true, .write: true}} → 发布");
+  }
+}
+
+/**
+ * 下载当前项目备份（JSON 文件，命名为 {PDFname}_MMDD.json）
+ */
+function downloadBackup() {
+  if (!state.pages.length) {
+    alert("请先导入 PDF 分镜后再下载备份。");
+    return;
+  }
+  const obj = buildShareObject(false);
+  obj.isBackup = true;
+
+  // Build filename: {PDFname}_MMDD.json
+  const pdfName = state.lastPdfFile
+    ? state.lastPdfFile.name.replace(/\.pdf$/i, "")
+    : "分镜备份";
+  const now = new Date();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const filename = pdfName + "_" + mm + dd + ".json";
+
+  downloadJsonFile(obj, filename);
+}
+
+/**
+ * 触发导入备份文件选择
+ */
+function importBackup() {
+  const input = document.getElementById("backup-import-input");
+  if (input instanceof HTMLInputElement) input.click();
 }
 
 async function tryConsumeShareHash() {
   const raw = location.hash.replace(/^#/, "");
   if (!raw) return false;
-
-  if (raw.startsWith("share-read=id:") || raw.startsWith("share-edit=id:")) {
-    const readOnly = raw.startsWith("share-read=");
-    const apiBase = loadCollabWsDefault();
-    if (!apiBase) {
-      if (els.main) {
-        els.main.innerHTML =
-          '<div class="empty-state empty-state--warn"><p><strong>无法打开分享链接</strong>：本站未配置分享服务（<code>collab-config.js</code> 中的 <code>STORYBOARD_COLLAB_WS</code>）。请让分享方提供 JSON 文件，使用「导入分享」打开。</p></div>';
-      }
-      state.fromShare = true;
-      state.shareReadOnly = true;
-      document.body.classList.add("share-readonly");
-      updateShareChrome();
-      return true;
-    }
-    return openShareFromServerId(apiBase, readOnly);
-  }
-
   let readOnly = null;
   let b64 = null;
   if (raw.startsWith("share-read=")) {
@@ -1121,11 +1255,44 @@ async function tryConsumeShareHash() {
 
 /**
  * @param {string} jsonText
+ * @param {File} [sourceFile] 原始 JSON 文件，用于兜底显示文件名
  */
-async function importShareFromJsonText(jsonText) {
+async function importShareFromJsonText(jsonText, sourceFile) {
   const data = JSON.parse(jsonText);
-  const ro = !!data.readOnly;
-  applySharePayloadToState(data, ro);
+  const isBackup = !!data.isBackup;
+  const ro = isBackup ? false : !!data.readOnly;
+
+  if (isBackup) {
+    // 备份文件：作为普通编辑模式加载，不进入"分享页"模式
+    if (!data || !Array.isArray(data.pages) || !data.pages.length) {
+      alert("备份文件格式无效或数据为空。");
+      return;
+    }
+    state.pages = data.pages;
+    state.fromShare = false;
+    state.shareReadOnly = false;
+    state.currentArchiveId = null;
+    state.pendingShareSlots = data.slots && typeof data.slots === "object" ? data.slots : null;
+    if (data.meta && typeof data.meta === "object") {
+      const m = data.meta;
+      if (m.pane && typeof m.pane === "object") savePaneWeights(m.pane);
+      if (typeof m.refCol === "number") saveRefColPx(m.refCol);
+      if (Array.isArray(m.rows) && m.rows.length === SLOTS_PER_PAGE) saveRowWeights(m.rows);
+    }
+    document.body.classList.remove("share-readonly");
+    // 保存到 session，这样去归档库再回来可以用「继续编辑」
+    state.sessionPages = state.pages.slice();
+    // 优先用备份里的 pdfName（meta.pdfName），其次 archiveName，
+    // 兜底用 JSON 文件名（去掉日期后缀和 .json 扩展名）
+    const fallbackName = sourceFile
+      ? sourceFile.name.replace(/\.json$/i, "").replace(/_\d{4}$/, "")
+      : null;
+    const backupName = (data.meta && data.meta.pdfName) || data.archiveName || fallbackName || null;
+    state.lastPdfFile = backupName ? { name: backupName } : state.lastPdfFile;
+  } else {
+    applySharePayloadToState(data, ro);
+  }
+
   history.replaceState(null, "", `${location.pathname}${location.search || ""}`);
   showEditorView();
   applyAllLayoutGlobals();
@@ -1141,15 +1308,67 @@ async function importShareFromJsonText(jsonText) {
 function exitShareView() {
   hideTextHoverLayer();
   destroyCollabSessionLocal();
-  state.fromShare = false;
-  state.shareReadOnly = false;
-  state.pages = [];
-  state.pendingShareSlots = null;
-  state.sessionSlots = null;
-  document.body.classList.remove("share-readonly");
-  history.replaceState(null, "", `${location.pathname}${location.search || ""}`);
-  updateShareChrome();
-  renderBoard();
+  stopRealtimeCollab(); // 停止 Firebase 实时协作
+
+  // 保存当前状态（不含只读分享），方便「继续编辑」恢复
+  const hasContent = state.pages.length > 0;
+  if (hasContent && !state.shareReadOnly) {
+    state.sessionSlots = collectSlotPayload();
+    state.sessionPages = state.pages.slice();
+  } else if (hasContent) {
+    state.sessionPages = state.pages.slice();
+  }
+
+  // 退出后弹出选择：保留内容或清除
+  const doExit = (keepContent) => {
+    if (!keepContent) {
+      state.sessionPages = [];
+      state.sessionSlots = null;
+      state.lastPdfFile = null;
+    }
+    state.fromShare = false;
+    state.shareReadOnly = false;
+    state.pages = [];
+    state.pendingShareSlots = null;
+    document.body.classList.remove("share-readonly");
+    history.replaceState(null, "", `${location.pathname}${location.search || ""}`);
+    updateShareChrome();
+    renderBoard();
+  };
+
+  // 关闭可能存在的分享链接弹窗
+  document.getElementById("share-link-dialog")?.remove();
+
+  // 弹出自定义选择框（5秒倒计时自动保留）
+  document.getElementById("exit-share-dialog")?.remove();
+  const dlg = document.createElement("div");
+  dlg.id = "exit-share-dialog";
+  dlg.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;display:flex;align-items:center;justify-content:center;";
+  dlg.innerHTML = `
+    <div style="background:#fff;border-radius:12px;padding:28px 32px;min-width:320px;max-width:480px;box-shadow:0 8px 40px rgba(0,0,0,.18);font-family:inherit;">
+      <div style="font-size:16px;font-weight:600;margin-bottom:10px;">退出分享页</div>
+      <div style="font-size:14px;color:#555;margin-bottom:24px;">是否保留本次内容，以便下次继续查看？</div>
+      <div style="display:flex;gap:10px;justify-content:flex-end;align-items:center;">
+        <button id="esd-clear" style="padding:8px 16px;background:#f1f3f4;border:none;border-radius:6px;cursor:pointer;font-size:13px;">清除内容，从头开始</button>
+        <button id="esd-keep" style="padding:8px 16px;background:#1a73e8;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">保留，可继续查看（<span id="esd-count">5</span>）</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(dlg);
+  let countdown = 5;
+  const countEl = dlg.querySelector("#esd-count");
+  const timer = setInterval(() => {
+    countdown--;
+    if (countEl) countEl.textContent = String(countdown);
+    if (countdown <= 0) {
+      clearInterval(timer);
+      dlg.remove();
+      doExit(true);
+    }
+  }, 1000);
+  dlg.querySelector("#esd-keep").addEventListener("click", () => { clearInterval(timer); dlg.remove(); doExit(true); });
+  dlg.querySelector("#esd-clear").addEventListener("click", () => { clearInterval(timer); dlg.remove(); doExit(false); });
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) { clearInterval(timer); dlg.remove(); doExit(true); } });
 }
 
 function updateShareChrome() {
@@ -1161,9 +1380,22 @@ function updateShareChrome() {
   const arch = document.getElementById("btn-archive-lib");
   const impLab = document.querySelector(".share-import-label");
   const impIn = document.getElementById("share-import-input");
+  const reopenBtn = document.getElementById("btn-reopen-session");
   if (!shareRow || !exit || !hint) return;
 
   const inLibrary = state.view === "library";
+
+  // 「继续编辑」按钮：当有已保存的 sessionPages 且当前没有打开的 PDF 时显示
+  if (reopenBtn instanceof HTMLElement) {
+    const canReopen = !inLibrary && !state.fromShare && !state.pages.length &&
+      state.sessionPages && state.sessionPages.length > 0;
+    reopenBtn.style.display = canReopen ? "" : "none";
+    if (canReopen) {
+      const name = state.lastPdfFile ? state.lastPdfFile.name.replace(/\.pdf$/i, "") : "";
+      reopenBtn.textContent = name ? "继续编辑：" + name : "继续编辑";
+      reopenBtn.title = name ? "返回上次编辑的分镜：" + name : "返回上次编辑的分镜";
+    }
+  }
 
   if (exitCollab instanceof HTMLElement) {
     const showExitCollab = state.collabActive && !state.fromShare;
@@ -1174,16 +1406,15 @@ function updateShareChrome() {
   if (state.collabActive && !state.fromShare) {
     exit.hidden = true;
     hint.hidden = false;
-    const st = collabStatusLine();
     hint.textContent =
-      (st ? st + " " : "") +
-      "「实时协作」已开启：多人同步编辑分镜、参考图与文字；编辑链接最多 6 人，阅读链接人数不限。可用「审核分享」导出静态备份。";
+      "「实时协作」已开启：多人同步编辑当前分镜与参考图。主持人已将编辑/阅读链接发出；编辑链接最多 6 人同时在线，阅读链接人数不限。可继续使用「审核分享 / 阅读分享」导出静态快照。";
     if (pdfLab instanceof HTMLElement) pdfLab.style.display = "";
     const pi = document.getElementById("pdf-input");
     if (pi) pi.style.display = "";
     if (arch instanceof HTMLElement) arch.style.display = inLibrary ? "none" : "";
     if (impLab instanceof HTMLElement) impLab.style.display = "";
     if (impIn instanceof HTMLElement) impIn.style.display = "";
+    // 归档库页面：隐藏分享按钮组；PDF页面：正常显示
     const showShare = state.view === "work" && state.pages.length > 0 && !inLibrary;
     shareRow.hidden = !showShare;
     return;
@@ -1191,32 +1422,42 @@ function updateShareChrome() {
 
   if (state.fromShare) {
     exit.hidden = false;
-    hint.hidden = false;
-    const collabTag = state.collabActive ? "（实时协作房间）" : "";
-    const st = state.collabActive ? collabStatusLine() : "";
-    const stPrefix = st ? st + " " : "";
-    hint.textContent = state.shareReadOnly
-      ? collabTag + stPrefix + "当前为「阅读分享」：可浏览分镜、参考图与文字悬停预览、图片放大；不可编辑或上传。"
-      : collabTag + stPrefix + "当前为「审核分享」：可继续编辑参考图与文字、使用全部预览与布局拖拽；也可再次生成分享。";
-    const hideCore = state.shareReadOnly;
-    if (pdfLab instanceof HTMLElement) pdfLab.style.display = hideCore ? "none" : "";
+    hint.hidden = true;
+    // 分享页：始终隐藏归档库按钮和导入PDF按钮（分享页内容固定，不允许替换）
+    if (arch instanceof HTMLElement) arch.style.display = "none";
+    if (pdfLab instanceof HTMLElement) pdfLab.style.display = "none";
     const pi = document.getElementById("pdf-input");
-    if (pi) pi.style.display = hideCore ? "none" : "";
-    if (arch instanceof HTMLElement) arch.style.display = hideCore ? "none" : "";
-    if (impLab instanceof HTMLElement) impLab.style.display = "";
-    if (impIn instanceof HTMLElement) impIn.style.display = "";
+    if (pi) pi.style.display = "none";
+    // 阅读分享（只读）：隐藏导入备份和下载备份；审核分享（编辑）：显示
+    const showBackupBtns = !state.shareReadOnly;
+    if (impLab instanceof HTMLElement) impLab.style.display = showBackupBtns ? "" : "none";
+    if (impIn instanceof HTMLElement) impIn.style.display = showBackupBtns ? "" : "none";
+    const dlBtn = document.getElementById("btn-download-backup");
+    const imBtn = document.getElementById("btn-import-backup");
+    if (dlBtn instanceof HTMLElement) dlBtn.style.display = showBackupBtns ? "" : "none";
+    if (imBtn instanceof HTMLElement) imBtn.style.display = showBackupBtns ? "" : "none";
+    // 只读模式：不显示分享按钮组；编辑模式且有内容时显示
     shareRow.hidden = !(state.pages.length > 0 && !state.shareReadOnly && !inLibrary);
+    // 审核分享模式下：隐藏"阅读分享"按钮（权限不能从分享页内降级）
+    const readBtn = document.getElementById("btn-share-read");
+    if (readBtn instanceof HTMLElement) readBtn.style.display = "none";
   } else {
     exit.hidden = true;
     hint.hidden = true;
-    if (pdfLab instanceof HTMLElement) pdfLab.style.display = "";
+    // 有PDF打开时隐藏导入PDF按钮（避免误替换当前分镜）
+    const hasPdf = state.pages.length > 0;
+    if (pdfLab instanceof HTMLElement) pdfLab.style.display = hasPdf ? "none" : "";
     const pi = document.getElementById("pdf-input");
-    if (pi) pi.style.display = "";
+    if (pi) pi.style.display = hasPdf ? "none" : "";
     if (arch instanceof HTMLElement) arch.style.display = inLibrary ? "none" : "";
     if (impLab instanceof HTMLElement) impLab.style.display = "";
     if (impIn instanceof HTMLElement) impIn.style.display = "";
+    // 归档库页面：完全隐藏分享按钮组；PDF页面才显示
     const showShare = state.view === "work" && state.pages.length > 0 && !inLibrary;
     shareRow.hidden = !showShare;
+    // 正常模式下恢复"阅读分享"按钮
+    const readBtn2 = document.getElementById("btn-share-read");
+    if (readBtn2 instanceof HTMLElement) readBtn2.style.display = "";
   }
 }
 
@@ -1225,7 +1466,39 @@ function wireShareUi() {
   document.getElementById("btn-share-read")?.addEventListener("click", () => void copyOrDownloadShare(true));
   document.getElementById("btn-exit-share")?.addEventListener("click", () => exitShareView());
   document.getElementById("btn-exit-collab")?.addEventListener("click", () => exitCollabOnly());
-  document.getElementById("btn-collab-host")?.addEventListener("click", () => void startCollabHostFlow());
+  document.getElementById("btn-download-backup")?.addEventListener("click", () => downloadBackup());
+  document.getElementById("btn-import-backup")?.addEventListener("click", () => importBackup());
+  // 重新打开上次加载的分镜内容（恢复 pages + sessionSlots）
+  document.getElementById("btn-reopen-session")?.addEventListener("click", () => {
+    if (!state.sessionPages || !state.sessionPages.length) return;
+    state.fromShare = false;
+    state.shareReadOnly = false;
+    document.body.classList.remove("share-readonly");
+    state.pages = state.sessionPages.slice();
+    renderBoard();
+    if (state.sessionSlots && Object.keys(state.sessionSlots).length) {
+      applySlotPayload(state.sessionSlots);
+    }
+    updateShareChrome();
+  });
+  // Wire backup import file input
+  document.getElementById("backup-import-input")?.addEventListener("change", (e) => {
+    const f = /** @type {HTMLInputElement} */ (e.target).files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        void importShareFromJsonText(String(r.result || ""), f);
+        alert("备份已成功导入！");
+      } catch (err) {
+        console.error(err);
+        alert("备份文件格式无效，请确认选择了正确的 .json 文件。");
+      }
+    };
+    r.readAsText(f);
+    /** @type {HTMLInputElement} */ (e.target).value = "";
+  });
+  // Legacy share-import-input (keep for compatibility)
   document.getElementById("share-import-input")?.addEventListener("change", (e) => {
     const f = /** @type {HTMLInputElement} */ (e.target).files?.[0];
     if (!f) return;
@@ -1508,7 +1781,8 @@ function showEditorView() {
   state.view = "work";
   const lib = document.getElementById("btn-archive-lib");
   const back = document.getElementById("btn-back-editor");
-  if (lib) lib.style.display = "";
+  // 分享页时归档库按钮保持隐藏，由 updateShareChrome 统一控制
+  if (lib) lib.style.display = state.fromShare ? "none" : "";
   if (back) back.style.display = "none";
   updateShareChrome();
 }
@@ -1690,6 +1964,7 @@ async function showArchiveLibrary() {
               </select>
             </div>
             <div class="archive-actions__tail">
+              <button type="button" class="btn btn-sm arch-download-backup" data-aid="${a.id}" title="下载此归档的 JSON 备份">下载备份</button>
               <button type="button" class="btn btn-sm arch-del" data-aid="${a.id}">删除</button>
               ${archiveStatusControlHtml(a, rs, rsTxt)}
             </div>
@@ -1797,6 +2072,32 @@ async function showArchiveLibrary() {
       if (!id || !confirm("确定删除该归档？")) return;
       await window.ArchiveDB.deleteArchive(id);
       void showArchiveLibrary();
+    });
+  });
+
+  tbody?.querySelectorAll(".arch-download-backup").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const id = b.getAttribute("data-aid");
+      if (!id) return;
+      const a = await window.ArchiveDB.getArchive(id);
+      if (!a) return;
+      // Build backup object from archive data
+      const archiveName = (a.name || "归档").replace(/\.pdf$/i, "");
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const dd = String(now.getDate()).padStart(2, "0");
+      const filename = archiveName + "_" + mm + dd + ".json";
+      // Build a share-compatible object with archive data
+      const backupObj = {
+        v: SHARE_BUNDLE_V,
+        readOnly: false,
+        isBackup: true,
+        archiveName: a.name,
+        pages: a.pages || [],
+        slots: a.slots || {},
+        meta: a.meta || {}
+      };
+      downloadJsonFile(backupObj, filename);
     });
   });
 
@@ -2679,8 +2980,86 @@ wireShareUi();
 initSessionAutosaveOnce();
 initDropzonePasteRoutingOnce();
 
+/**
+ * 处理 ?share=ID&mode=... URL 参数，从 Firebase 加载分享数据
+ * @returns {Promise<boolean>}
+ */
+async function tryConsumeFirebaseShareParam() {
+  const params = new URLSearchParams(window.location.search);
+  const shareId = params.get("share");
+  if (!shareId) return false;
+  const mode = params.get("mode") || "readonly";
+  const readOnly = mode === "readonly";
+
+  // 获取 databaseURL（REST API 方式，不依赖 SDK）
+  let dbUrl = "";
+  if (typeof firebaseConfig !== "undefined" && firebaseConfig.databaseURL) {
+    dbUrl = firebaseConfig.databaseURL.replace(/\/$/, "");
+  } else if (typeof firebase !== "undefined") {
+    try { dbUrl = firebase.app().options.databaseURL.replace(/\/$/, ""); } catch(_) {}
+  }
+
+  if (!dbUrl) {
+    console.warn("找不到 Firebase databaseURL，无法加载分享链接。");
+    return false;
+  }
+
+  if (els.main) {
+    els.main.innerHTML = '<div class="loading"><div class="spinner"></div><span>正在加载分享数据…</span></div>';
+  }
+
+  try {
+    // 使用 REST API 读取（不依赖 SDK）
+    const restUrl = dbUrl + "/shares/" + shareId + ".json";
+    console.log("[分享] 正在读取:", restUrl);
+    const resp = await fetch(restUrl);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const val = await resp.json();
+
+    if (!val) {
+      if (els.main) {
+        els.main.innerHTML = '<div class="empty-state empty-state--warn"><p><strong>分享链接无效或已过期。</strong></p><p>点击「退出分享页」返回首页。</p></div>';
+      }
+      state.fromShare = true;
+      state.shareReadOnly = true;
+      updateShareChrome();
+      return true;
+    }
+    const data = JSON.parse(val.data);
+    // Clear share param from URL without reload
+    const cleanUrl = window.location.href.split("?")[0];
+    history.replaceState(null, "", cleanUrl);
+    applySharePayloadToState(data, readOnly);
+    // 打开分享链接后，启动实时协作监听（含只读，用于显示在线人数）
+    startRealtimeCollab(shareId, readOnly);
+    return true;
+  } catch (err) {
+    console.error("加载 Firebase 分享失败：", err);
+    if (els.main) {
+      els.main.innerHTML = '<div class="empty-state empty-state--warn"><p><strong>加载分享数据失败：' + String(err.message || err) + '</strong></p><p>点击「退出分享页」返回首页。</p></div>';
+    }
+    state.fromShare = true;
+    state.shareReadOnly = true;
+    updateShareChrome();
+    return true;
+  }
+}
+
 async function bootstrapApp() {
   try {
+    if (await tryConsumeFirebaseShareParam()) {
+      showEditorView();
+      applyAllLayoutGlobals();
+      renderBoard();
+      const shareSlots = state.pendingShareSlots;
+      if (shareSlots) {
+        applySlotPayload(shareSlots);
+        state.sessionSlots = cloneSlots(shareSlots);
+        state.pendingShareSlots = null;
+      }
+      updateShareChrome();
+      return;
+    }
     if (await tryConsumeCollabHash()) {
       applyAllLayoutGlobals();
       updateShareChrome();
@@ -2713,6 +3092,14 @@ async function bootstrapApp() {
   }
   renderBoard();
   updateShareChrome();
+  // 若 sessionStorage 保存了 shareId（编辑方页面刷新后），重新加入实时协作
+  try {
+    const savedShareId = sessionStorage.getItem(SS_REALTIME_SHARE);
+    if (savedShareId && !state.fromShare) {
+      console.log("[实时协作] 从 sessionStorage 恢复 shareId:", savedShareId);
+      startRealtimeCollab(savedShareId, false);
+    }
+  } catch(_) {}
 }
 
 void bootstrapApp();
