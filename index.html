@@ -10,18 +10,17 @@
       href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="./original-styles.css" />
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <header class="app-header">
       <h1>分镜审核台</h1>
-      <p>
-        PDF 按页完整展示。拖竖线调分镜/审核区与教研/导演比例；格内竖线调参考图与文字宽。分镜放大后滚轮缩放。
-      </p>
       <div class="toolbar-actions">
         <div class="toolbar-end-cluster">
           <input id="pdf-input" type="file" class="hidden-input" accept="application/pdf" title="" />
           <label for="pdf-input" class="btn btn-sm btn-primary pdf-import-label">导入 PDF 分镜</label>
+          <span id="current-pdf-name" class="current-pdf-name" style="display:none"></span>
+          <button type="button" id="btn-reopen" class="btn btn-sm btn-reopen" style="display:none">继续编辑</button>
           <span id="share-actions" class="share-actions" hidden>
             <button type="button" id="btn-share-edit" class="btn btn-sm btn-share-edit" title="生成可编辑的分享链接">
               审核分享
@@ -29,14 +28,15 @@
             <button type="button" id="btn-share-read" class="btn btn-sm btn-share-read" title="生成仅预览的分享链接">
               阅读分享
             </button>
-            <button type="button" id="btn-download-json" class="btn btn-sm btn-tonal" title="下载当前工作区数据为JSON备份">下载备份</button>
-            <button type="button" id="btn-import-json" class="btn btn-sm btn-tonal" title="从JSON备份文件导入数据">导入备份</button>
+            <button type="button" id="btn-download-backup" class="btn btn-sm btn-tonal">下载备份</button>
+            <input id="import-backup-input" type="file" class="hidden-input" accept="application/json,.json" title="" />
+            <label for="import-backup-input" class="btn btn-sm btn-tonal import-backup-label">导入备份</label>
           </span>
+          <button type="button" id="btn-exit-share" class="btn btn-sm btn-exit-share" hidden>退出分享页</button>
           <button type="button" id="btn-back-editor" class="btn btn-sm btn-back" style="display: none">返回编辑</button>
           <button type="button" id="btn-archive-lib" class="btn btn-sm btn-archive">归档库</button>
         </div>
       </div>
-      <p id="share-mode-hint" class="share-mode-hint" hidden></p>
     </header>
     <main id="main"></main>
     <div id="storyboard-lightbox" class="lightbox" hidden aria-modal="true" role="dialog" aria-label="分镜放大">
@@ -54,7 +54,6 @@
           <button type="button" id="lb-zoom-reset" class="btn btn-sm btn-tonal">还原</button>
           <button type="button" class="btn btn-sm btn-tonal lightbox-close">关闭（Esc）</button>
         </div>
-        <p class="lightbox-hint">滚轮缩放 · 放大后可拖拽平移</p>
       </div>
     </div>
     <div id="text-hover-layer" class="text-hover-layer" hidden role="tooltip"></div>
@@ -69,15 +68,10 @@
         </div>
       </div>
     </div>
-    <!-- Firebase SDK -->
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
-
-    <!-- PDF.js -->
+    <!-- 在线人数指示器 -->
+    <div id="realtime-indicator" class="realtime-indicator" style="display:none"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" crossorigin="anonymous"></script>
-
-    <!-- 项目脚本 -->
-    <script src="./original-archive-db.js"></script>
+    <script src="./archive-db.js"></script>
     <script>
       if (typeof pdfjsLib !== "undefined") {
         pdfjsLib.GlobalWorkerOptions.workerSrc =
@@ -85,8 +79,6 @@
       }
     </script>
     <script src="./firebase-config.js"></script>
-    <script src="./collab-sync.js"></script>
-    <script src="./original-app.js" defer></script>
-    <script src="./app-patch.js" defer></script>
+    <script src="./app.js" defer></script>
   </body>
 </html>
