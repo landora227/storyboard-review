@@ -851,7 +851,10 @@ function showShareLinkDialog(shareUrl) {
 
   const close = () => dialog.remove();
   dialog.querySelector("#sld-close").addEventListener("click", close);
-  dialog.addEventListener("click", (e) => { if (e.target === dialog) close(); });
+  // 延迟 300ms 再监听遮罩点击，避免触发弹窗的鼠标事件意外关闭弹窗
+  setTimeout(() => {
+    dialog.addEventListener("click", (e) => { if (e.target === dialog) close(); });
+  }, 300);
 }
 
 // ─────────────────────────────────────────────
